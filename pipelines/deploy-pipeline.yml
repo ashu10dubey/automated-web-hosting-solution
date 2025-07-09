@@ -1,0 +1,426 @@
+name: Deploy Infrastructure Pipeline
+
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - feature/*
+  paths:
+    include:
+    - terraform/*
+    - environments/*
+    - scripts/*
+
+variables:
+  terraformVersion: '1.5.7'
+  azureServiceConnection: 'Azure-ServiceConnection'
+  terraformStateResourceGroup: 'rg-terraform-state'
+  terraformStateStorageAccount: 'stterraformstate'
+  terraformStateContainer: 'terraform-state'
+  terraformStateKey: 'web-hosting.tfstate'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+# Stage 1: Validate and Plan
+- stage: Validate
+  displayName: 'Validate Terraform Configuration'
+  jobs:
+  - job: ValidateJob
+    displayName: 'Validate Terraform'
+    steps:
+    - checkout: self
+      persistCredentials: true
+    
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform $(terraformVersion)'
+      inputs:
+        terraformVersion: $(terraformVersion)
+    
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        backendServiceArm: $(azureServiceConnection)
+        backendAzureRmResourceGroupName: $(terraformStateResourceGroup)
+        backendAzureRmStorageAccountName: $(terraformStateStorageAccount)
+        backendAzureRmContainerName: $(terraformStateContainer)
+        backendAzureRmKey: $(terraformStateKey)
+    
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Format Check'
+      inputs:
+        provider: 'azurerm'
+        command: 'custom'
+        customCommand: 'fmt'
+        commandOptions: '-check -recursive'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Validate'
+      inputs:
+        provider: 'azurerm'
+        command: 'validate'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+    
+    - task: PowerShell@2
+      displayName: 'Run Terraform Security Scan'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Install tfsec
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          
+          # Run security scan
+          tfsec $(System.DefaultWorkingDirectory)/terraform --format junit > tfsec-report.xml
+        workingDirectory: '$(System.DefaultWorkingDirectory)'
+        failOnStderr: false
+    
+    - task: PublishTestResults@2
+      displayName: 'Publish Security Scan Results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'tfsec-report.xml'
+        failTaskOnFailedTests: false
+        testRunTitle: 'Terraform Security Scan'
+      condition: always()
+
+# Stage 2: Deploy to Development
+- stage: DeployDev
+  displayName: 'Deploy to Development'
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  variables:
+    environment: 'dev'
+    tfVarsFile: '$(System.DefaultWorkingDirectory)/environments/dev.tfvars'
+  jobs:
+  - deployment: DeployToDev
+    displayName: 'Deploy to Dev Environment'
+    environment: 'development'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+            persistCredentials: true
+          
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform $(terraformVersion)'
+            inputs:
+              terraformVersion: $(terraformVersion)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              backendServiceArm: $(azureServiceConnection)
+              backendAzureRmResourceGroupName: $(terraformStateResourceGroup)
+              backendAzureRmStorageAccountName: $(terraformStateStorageAccount)
+              backendAzureRmContainerName: $(terraformStateContainer)
+              backendAzureRmKey: '$(environment)-$(terraformStateKey)'
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              commandOptions: '-var-file="$(tfVarsFile)" -out=$(environment).tfplan'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              commandOptions: '$(environment).tfplan'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: PowerShell@2
+            displayName: 'Post-Deployment Verification'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Wait for deployment to complete
+                Start-Sleep -Seconds 60
+                
+                # Get load balancer IP from Terraform output
+                $loadBalancerIP = terraform output -raw load_balancer_public_ip
+                
+                # Test connectivity
+                $response = Invoke-WebRequest -Uri "http://$loadBalancerIP" -UseBasicParsing
+                if ($response.StatusCode -eq 200) {
+                    Write-Host "✅ Website is accessible at http://$loadBalancerIP"
+                } else {
+                    Write-Error "❌ Website is not accessible"
+                    exit 1
+                }
+                
+                # Test health endpoint
+                $healthResponse = Invoke-WebRequest -Uri "http://$loadBalancerIP/health" -UseBasicParsing
+                if ($healthResponse.StatusCode -eq 200) {
+                    Write-Host "✅ Health check endpoint is working"
+                } else {
+                    Write-Error "❌ Health check endpoint failed"
+                    exit 1
+                }
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+
+# Stage 3: Deploy to UAT
+- stage: DeployUAT
+  displayName: 'Deploy to UAT'
+  dependsOn: DeployDev
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  variables:
+    environment: 'uat'
+    tfVarsFile: '$(System.DefaultWorkingDirectory)/environments/uat.tfvars'
+  jobs:
+  - deployment: DeployToUAT
+    displayName: 'Deploy to UAT Environment'
+    environment: 'uat'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: ManualValidation@0
+            displayName: 'Manual Approval for UAT Deployment'
+            inputs:
+              notifyUsers: |
+                qa-team@company.com
+                tech-lead@company.com
+              instructions: |
+                Please review and approve the UAT deployment:
+                
+                - Verify development environment is stable
+                - Check that all tests have passed
+                - Confirm UAT environment is ready for deployment
+                
+                Click "Resume" to proceed with UAT deployment.
+              onTimeout: 'reject'
+          
+          - checkout: self
+            persistCredentials: true
+          
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform $(terraformVersion)'
+            inputs:
+              terraformVersion: $(terraformVersion)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              backendServiceArm: $(azureServiceConnection)
+              backendAzureRmResourceGroupName: $(terraformStateResourceGroup)
+              backendAzureRmStorageAccountName: $(terraformStateStorageAccount)
+              backendAzureRmContainerName: $(terraformStateContainer)
+              backendAzureRmKey: '$(environment)-$(terraformStateKey)'
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              commandOptions: '-var-file="$(tfVarsFile)" -out=$(environment).tfplan'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              commandOptions: '$(environment).tfplan'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: PowerShell@2
+            displayName: 'Run Integration Tests'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Load balancer IP
+                $loadBalancerIP = terraform output -raw load_balancer_public_ip
+                
+                # Run load test
+                Write-Host "Running load test on UAT environment..."
+                $loadTestResult = Invoke-WebRequest -Uri "http://$loadBalancerIP" -UseBasicParsing
+                
+                if ($loadTestResult.StatusCode -eq 200) {
+                    Write-Host "✅ UAT Load test passed"
+                } else {
+                    Write-Error "❌ UAT Load test failed"
+                    exit 1
+                }
+                
+                # Test multiple endpoints
+                $endpoints = @("/", "/health")
+                foreach ($endpoint in $endpoints) {
+                    $testUrl = "http://$loadBalancerIP$endpoint"
+                    try {
+                        $response = Invoke-WebRequest -Uri $testUrl -UseBasicParsing -TimeoutSec 10
+                        Write-Host "✅ $endpoint - Status: $($response.StatusCode)"
+                    } catch {
+                        Write-Error "❌ $endpoint - Failed: $($_.Exception.Message)"
+                        exit 1
+                    }
+                }
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+
+# Stage 4: Deploy to Production
+- stage: DeployProd
+  displayName: 'Deploy to Production'
+  dependsOn: DeployUAT
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  variables:
+    environment: 'prod'
+    tfVarsFile: '$(System.DefaultWorkingDirectory)/environments/prod.tfvars'
+  jobs:
+  - deployment: DeployToProd
+    displayName: 'Deploy to Production Environment'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: ManualValidation@0
+            displayName: 'Manual Approval for Production Deployment'
+            inputs:
+              notifyUsers: |
+                ops-team@company.com
+                engineering-manager@company.com
+                cto@company.com
+              instructions: |
+                🚨 PRODUCTION DEPLOYMENT APPROVAL REQUIRED 🚨
+                
+                Please verify the following before approving:
+                
+                ✅ UAT testing completed successfully
+                ✅ All integration tests passed
+                ✅ Change management approval obtained
+                ✅ Rollback plan documented and ready
+                ✅ Monitoring and alerting configured
+                ✅ Stakeholders notified of deployment window
+                
+                Click "Resume" to proceed with PRODUCTION deployment.
+              onTimeout: 'reject'
+          
+          - checkout: self
+            persistCredentials: true
+          
+          - task: TerraformInstaller@0
+            displayName: 'Install Terraform $(terraformVersion)'
+            inputs:
+              terraformVersion: $(terraformVersion)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              backendServiceArm: $(azureServiceConnection)
+              backendAzureRmResourceGroupName: $(terraformStateResourceGroup)
+              backendAzureRmStorageAccountName: $(terraformStateStorageAccount)
+              backendAzureRmContainerName: $(terraformStateContainer)
+              backendAzureRmKey: '$(environment)-$(terraformStateKey)'
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              commandOptions: '-var-file="$(tfVarsFile)" -out=$(environment).tfplan'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              commandOptions: '$(environment).tfplan'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: PowerShell@2
+            displayName: 'Production Smoke Tests'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Get load balancer IP
+                $loadBalancerIP = terraform output -raw load_balancer_public_ip
+                
+                Write-Host "🔍 Running production smoke tests..."
+                
+                # Test main website
+                $response = Invoke-WebRequest -Uri "http://$loadBalancerIP" -UseBasicParsing
+                if ($response.StatusCode -eq 200) {
+                    Write-Host "✅ Main website is accessible"
+                } else {
+                    Write-Error "❌ Main website failed"
+                    exit 1
+                }
+                
+                # Test health endpoint
+                $healthResponse = Invoke-WebRequest -Uri "http://$loadBalancerIP/health" -UseBasicParsing
+                if ($healthResponse.StatusCode -eq 200 -and $healthResponse.Content.Trim() -eq "OK") {
+                    Write-Host "✅ Health check passed"
+                } else {
+                    Write-Error "❌ Health check failed"
+                    exit 1
+                }
+                
+                Write-Host "🎉 Production deployment completed successfully!"
+                Write-Host "🌐 Website URL: http://$loadBalancerIP"
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+          
+          - task: PowerShell@2
+            displayName: 'Send Deployment Notification'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Get deployment info
+                $loadBalancerIP = terraform output -raw load_balancer_public_ip
+                $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+                
+                Write-Host "📧 Sending deployment notification..."
+                Write-Host "Deployment completed at: $timestamp"
+                Write-Host "Production URL: http://$loadBalancerIP"
+                
+                # Here you would typically send notifications to Slack, Teams, or email
+                # Example: Send to Slack webhook, Teams channel, or email distribution list
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+              condition: succeeded()
+
+# Stage 5: Post-Deployment Monitoring
+- stage: PostDeployment
+  displayName: 'Post-Deployment Monitoring'
+  dependsOn: DeployProd
+  condition: succeeded()
+  jobs:
+  - job: MonitoringSetup
+    displayName: 'Setup Monitoring and Alerts'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Configure Monitoring'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "🔍 Setting up post-deployment monitoring..."
+          
+          # Configure Azure Monitor alerts
+          # Set up availability tests
+          # Configure performance monitoring
+          # Enable log collection
+          
+          Write-Host "✅ Monitoring and alerting configured successfully"

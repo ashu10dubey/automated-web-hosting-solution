@@ -80,7 +80,11 @@ automated-web-hosting-solution/
 │   ├── variables.tf                   # Variable definitions
 │   ├── outputs.tf                     # Output definitions
 │   ├── versions.tf                    # Provider versions
-│   
+│   └── modules/                       # Reusable Terraform modules
+│       ├── network/                   # Network module
+│       ├── compute/                   # VM module
+│       ├── load-balancer/             # Load balancer module
+│       └── security/                  # Security module
 ├── environments/                       # Environment-specific configurations
 │   ├── dev.tfvars                     # Development environment
 │   ├── uat.tfvars                     # UAT environment
