@@ -1,0 +1,171 @@
+# azure-pipelines.yml
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    include:
+    - terraform/*
+    - environments/*
+
+variables:
+  terraformVersion: '1.5.0'
+  azureServiceConnection: 'Azure-ServiceConnection'
+
+stages:
+- stage: Validate
+  displayName: 'Validate Terraform'
+  jobs:
+  - job: Validate
+    displayName: 'Terraform Validate'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: $(terraformVersion)
+    
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: 'terraform'
+        backendServiceArm: $(azureServiceConnection)
+        backendAzureRmResourceGroupName: 'rg-terraform-state'
+        backendAzureRmStorageAccountName: 'stterraformstate'
+        backendAzureRmContainerName: 'terraform-state'
+        backendAzureRmKey: 'web-hosting.tfstate'
+    
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Validate'
+      inputs:
+        provider: 'azurerm'
+        command: 'validate'
+        workingDirectory: 'terraform'
+
+- stage: DeployDev
+  displayName: 'Deploy to Development'
+  dependsOn: Validate
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+  jobs:
+  - deployment: DeployToDev
+    displayName: 'Deploy to Dev Environment'
+    environment: 'dev'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: 'terraform'
+              commandOptions: '-var-file="../environments/dev.tfvars"'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: 'terraform'
+              commandOptions: '-var-file="../environments/dev.tfvars"'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+
+- stage: DeployUAT
+  displayName: 'Deploy to UAT'
+  dependsOn: DeployDev
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  jobs:
+  - deployment: DeployToUAT
+    displayName: 'Deploy to UAT Environment'
+    environment: 'uat'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: ManualValidation@0
+            displayName: 'Manual Approval for UAT'
+            inputs:
+              notifyUsers: 'qa-team@company.com'
+              instructions: 'Please validate and approve deployment to UAT environment'
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: 'terraform'
+              commandOptions: '-var-file="../environments/uat.tfvars"'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: 'terraform'
+              commandOptions: '-var-file="../environments/uat.tfvars"'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+
+- stage: DeployProd
+  displayName: 'Deploy to Production'
+  dependsOn: DeployUAT
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  jobs:
+  - deployment: DeployToProd
+    displayName: 'Deploy to Production Environment'
+    environment: 'production'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: ManualValidation@0
+            displayName: 'Manual Approval for Production'
+            inputs:
+              notifyUsers: 'ops-team@company.com'
+              instructions: 'Please validate and approve deployment to Production environment'
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: 'terraform'
+              commandOptions: '-var-file="../environments/prod.tfvars"'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+          
+          - task: TerraformTaskV3@3
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: 'terraform'
+              commandOptions: '-var-file="../environments/prod.tfvars"'
+              environmentServiceNameAzureRM: $(azureServiceConnection)
+- stage: Cleanup
+  displayName: 'Cleanup Resources'
+  jobs:
+  - job: Cleanup
+    displayName: 'Cleanup Resources'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Destroy'
+      inputs:
+        provider: 'azurerm'
+        command: 'destroy'
+        workingDirectory: 'terraform'
+        commandOptions: '-var-file="../environments/prod.tfvars"'
+        environmentServiceNameAzureRM: $(azureServiceConnection)

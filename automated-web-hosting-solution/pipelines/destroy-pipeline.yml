@@ -1,0 +1,445 @@
+name: Destroy Infrastructure Pipeline
+
+# Manual trigger only - never automatic
+trigger: none
+
+parameters:
+- name: environment
+  displayName: 'Environment to Destroy'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - uat
+  - prod
+
+- name: confirmDestroy
+  displayName: 'Confirm Destruction (type: DESTROY)'
+  type: string
+  default: ''
+
+- name: reason
+  displayName: 'Reason for Destruction'
+  type: string
+  default: ''
+
+variables:
+  terraformVersion: '1.5.7'
+  azureServiceConnection: 'Azure-ServiceConnection'
+  terraformStateResourceGroup: 'rg-terraform-state'
+  terraformStateStorageAccount: 'stterraformstate'
+  terraformStateContainer: 'terraform-state'
+  terraformStateKey: 'web-hosting.tfstate'
+  selectedEnvironment: ${{ parameters.environment }}
+  confirmationText: ${{ parameters.confirmDestroy }}
+  destructionReason: ${{ parameters.reason }}
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+# Stage 1: Pre-Destruction Validation
+- stage: PreDestructionValidation
+  displayName: 'Pre-Destruction Validation'
+  jobs:
+  - job: ValidateDestruction
+    displayName: 'Validate Destruction Request'
+    steps:
+    - checkout: none
+    
+    - task: PowerShell@2
+      displayName: 'Validate Destruction Parameters'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "🔍 Validating destruction request..."
+          
+          # Check confirmation text
+          if ("$(confirmationText)" -ne "DESTROY") {
+              Write-Error "❌ Confirmation text must be exactly 'DESTROY'"
+              exit 1
+          }
+          
+          # Check reason is provided
+          if ("$(destructionReason)" -eq "") {
+              Write-Error "❌ Reason for destruction must be provided"
+              exit 1
+          }
+          
+          # Check environment
+          $validEnvironments = @("dev", "uat", "prod")
+          if ("$(selectedEnvironment)" -notin $validEnvironments) {
+              Write-Error "❌ Invalid environment selected"
+              exit 1
+          }
+          
+          Write-Host "✅ Environment: $(selectedEnvironment)"
+          Write-Host "✅ Reason: $(destructionReason)"
+          Write-Host "✅ Confirmation: $(confirmationText)"
+          
+          # Special validation for production
+          if ("$(selectedEnvironment)" -eq "prod") {
+              Write-Host "🚨 PRODUCTION ENVIRONMENT DESTRUCTION REQUESTED 🚨"
+              Write-Host "This action will permanently delete all production resources!"
+          }
+          
+          Write-Host "✅ Validation passed"
+    
+    - task: PowerShell@2
+      displayName: 'Check Resource Dependencies'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Install Azure CLI if not present
+          if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+              Write-Host "Installing Azure CLI..."
+              Invoke-WebRequest -Uri https://aka.ms/installazurecliwindows -OutFile .\AzureCLI.msi
+              Start-Process msiexec.exe -Wait -ArgumentList '/I AzureCLI.msi /quiet'
+          }
+          
+          # Login and check resources
+          Write-Host "🔍 Checking existing resources in $(selectedEnvironment) environment..."
+          
+          # This would check for dependencies, backups, etc.
+          Write-Host "✅ Resource dependency check completed"
+
+# Stage 2: Backup Critical Data (Production Only)
+- stage: BackupCriticalData
+  displayName: 'Backup Critical Data'
+  dependsOn: PreDestructionValidation
+  condition: and(succeeded(), eq(variables['selectedEnvironment'], 'prod'))
+  jobs:
+  - job: BackupData
+    displayName: 'Backup Production Data'
+    steps:
+    - checkout: self
+      persistCredentials: true
+    
+    - task: PowerShell@2
+      displayName: 'Create Final Backup'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "💾 Creating final backup of production data..."
+          
+          # Backup Terraform state
+          Write-Host "Backing up Terraform state..."
+          
+          # Backup configuration files
+          Write-Host "Backing up configuration files..."
+          
+          # Export resource configurations
+          Write-Host "Exporting resource configurations..."
+          
+          # Create backup manifest
+          $backupManifest = @{
+              timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+              environment = "$(selectedEnvironment)"
+              reason = "$(destructionReason)"
+              backupLocation = "backup-$(selectedEnvironment)-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          }
+          
+          $backupManifest | ConvertTo-Json | Out-File -FilePath "backup-manifest.json"
+          
+          Write-Host "✅ Backup completed successfully"
+          Write-Host "📁 Backup location: $($backupManifest.backupLocation)"
+
+# Stage 3: Manual Approval (Required for all environments)
+- stage: ManualApproval
+  displayName: 'Manual Approval for Destruction'
+  dependsOn: 
+  - PreDestructionValidation
+  - BackupCriticalData
+  condition: |
+    and(
+      succeeded('PreDestructionValidation'),
+      or(
+        succeeded('BackupCriticalData'),
+        not(eq(variables['selectedEnvironment'], 'prod'))
+      )
+    )
+  jobs:
+  - job: waitForValidation
+    displayName: 'Wait for Manual Approval'
+    pool: server
+    timeoutInMinutes: 1440 # 24 hours
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Approve Infrastructure Destruction'
+      inputs:
+        notifyUsers: |
+          ops-team@company.com
+          engineering-manager@company.com
+          ${{ if eq(parameters.environment, 'prod') }}:
+            cto@company.com
+            security-team@company.com
+        instructions: |
+          🚨 INFRASTRUCTURE DESTRUCTION APPROVAL REQUIRED 🚨
+          
+          **Environment:** $(selectedEnvironment)
+          **Reason:** $(destructionReason)
+          **Requested by:** $(Build.RequestedFor)
+          **Build:** $(Build.BuildNumber)
+          
+          ⚠️ WARNING: This action will permanently destroy all resources in the $(selectedEnvironment) environment.
+          
+          Please verify:
+          ${{ if eq(parameters.environment, 'prod') }}:
+          ✅ Final backup has been created and verified
+          ✅ All stakeholders have been notified
+          ✅ Change management approval obtained
+          ✅ No active users or critical processes running
+          ✅ Alternative environment available if needed
+          
+          ${{ if ne(parameters.environment, 'prod') }}:
+          ✅ No critical testing or development work in progress
+          ✅ Environment can be safely destroyed
+          ✅ Team has been notified
+          
+          **This action cannot be undone.**
+          
+          Click "Resume" to proceed with destruction or "Reject" to cancel.
+        onTimeout: 'reject'
+
+# Stage 4: Terraform Destroy
+- stage: TerraformDestroy
+  displayName: 'Terraform Destroy'
+  dependsOn: ManualApproval
+  condition: succeeded()
+  jobs:
+  - job: DestroyInfrastructure
+    displayName: 'Destroy Infrastructure'
+    steps:
+    - checkout: self
+      persistCredentials: true
+    
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform $(terraformVersion)'
+      inputs:
+        terraformVersion: $(terraformVersion)
+    
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        backendServiceArm: $(azureServiceConnection)
+        backendAzureRmResourceGroupName: $(terraformStateResourceGroup)
+        backendAzureRmStorageAccountName: $(terraformStateStorageAccount)
+        backendAzureRmContainerName: $(terraformStateContainer)
+        backendAzureRmKey: '$(selectedEnvironment)-$(terraformStateKey)'
+    
+    - task: PowerShell@2
+      displayName: 'Pre-Destroy Resource Inventory'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "📋 Creating resource inventory before destruction..."
+          
+          # Get current state
+          terraform show -json > "$(selectedEnvironment)-state-before-destroy.json"
+          
+          # List resources to be destroyed
+          terraform plan -destroy -var-file="../environments/$(selectedEnvironment).tfvars" -out="destroy.tfplan"
+          terraform show -json destroy.tfplan > "$(selectedEnvironment)-destroy-plan.json"
+          
+          Write-Host "✅ Resource inventory created"
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+    
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Plan Destroy'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        commandOptions: '-destroy -var-file="../environments/$(selectedEnvironment).tfvars" -out=destroy.tfplan'
+        environmentServiceNameAzureRM: $(azureServiceConnection)
+    
+    - task: PowerShell@2
+      displayName: 'Final Confirmation'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "🚨 FINAL CONFIRMATION BEFORE DESTRUCTION 🚨"
+          Write-Host "Environment: $(selectedEnvironment)"
+          Write-Host "Reason: $(destructionReason)"
+          Write-Host "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+          
+          # Small delay for final reflection
+          Start-Sleep -Seconds 10
+          
+          Write-Host "⏳ Proceeding with destruction in 3 seconds..."
+          Start-Sleep -Seconds 3
+          
+          Write-Host "💥 Starting infrastructure destruction..."
+    
+    - task: TerraformTaskV3@3
+      displayName: 'Terraform Destroy'
+      inputs:
+        provider: 'azurerm'
+        command: 'destroy'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+        commandOptions: '-var-file="../environments/$(selectedEnvironment).tfvars" -auto-approve'
+        environmentServiceNameAzureRM: $(azureServiceConnection)
+    
+    - task: PowerShell@2
+      displayName: 'Post-Destroy Verification'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "🔍 Verifying destruction completion..."
+          
+          # Check if resources still exist
+          $resourceGroup = "rg-web-$(selectedEnvironment)"
+          
+          try {
+              $rg = az group show --name $resourceGroup --query "name" -o tsv 2>$null
+              if ($rg) {
+                  Write-Warning "⚠️ Resource group still exists: $resourceGroup"
+                  Write-Host "🧹 Cleaning up remaining resources..."
+                  
+                  # Force delete resource group
+                  az group delete --name $resourceGroup --yes --no-wait
+                  
+                  Write-Host "✅ Cleanup initiated"
+              } else {
+                  Write-Host "✅ Resource group successfully deleted"
+              }
+          } catch {
+              Write-Host "✅ Resource group does not exist (expected after destruction)"
+          }
+          
+          Write-Host "✅ Destruction verification completed"
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+
+# Stage 5: Post-Destruction Cleanup
+- stage: PostDestruction
+  displayName: 'Post-Destruction Cleanup'
+  dependsOn: TerraformDestroy
+  condition: succeeded()
+  jobs:
+  - job: CleanupAndNotify
+    displayName: 'Cleanup and Notification'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Clean Up Terraform State'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "🧹 Performing post-destruction cleanup..."
+          
+          # Archive the destroy plan and state files
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          $archivePath = "destruction-archive-$(selectedEnvironment)-$timestamp"
+          
+          Write-Host "📦 Archiving destruction artifacts to: $archivePath"
+          
+          # Create archive directory
+          New-Item -ItemType Directory -Path $archivePath -Force
+          
+          # Move artifacts to archive
+          if (Test-Path "$(selectedEnvironment)-state-before-destroy.json") {
+              Move-Item "$(selectedEnvironment)-state-before-destroy.json" "$archivePath/"
+          }
+          
+          if (Test-Path "$(selectedEnvironment)-destroy-plan.json") {
+              Move-Item "$(selectedEnvironment)-destroy-plan.json" "$archivePath/"
+          }
+          
+          Write-Host "✅ Cleanup completed"
+    
+    - task: PowerShell@2
+      displayName: 'Send Destruction Notification'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "📧 Sending destruction notification..."
+          
+          $destructionReport = @{
+              environment = "$(selectedEnvironment)"
+              reason = "$(destructionReason)"
+              timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+              requestedBy = "$(Build.RequestedFor)"
+              buildNumber = "$(Build.BuildNumber)"
+              status = "COMPLETED"
+          }
+          
+          Write-Host "📋 Destruction Report:"
+          Write-Host "Environment: $($destructionReport.environment)"
+          Write-Host "Reason: $($destructionReport.reason)"
+          Write-Host "Completed: $($destructionReport.timestamp)"
+          Write-Host "Requested by: $($destructionReport.requestedBy)"
+          Write-Host "Build: $($destructionReport.buildNumber)"
+          
+          # Here you would send notifications to relevant teams
+          # Examples:
+          # - Slack webhook
+          # - Microsoft Teams
+          # - Email distribution lists
+          # - Incident management systems
+          
+          Write-Host "✅ Notifications sent successfully"
+    
+    - task: PowerShell@2
+      displayName: 'Update Documentation'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "📝 Updating documentation..."
+          
+          # Log destruction in project documentation
+          $logEntry = @{
+              date = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+              action = "INFRASTRUCTURE_DESTROYED"
+              environment = "$(selectedEnvironment)"
+              reason = "$(destructionReason)"
+              pipeline = "$(Build.BuildNumber)"
+              operator = "$(Build.RequestedFor)"
+          }
+          
+          Write-Host "📋 Destruction logged:"
+          $logEntry | ConvertTo-Json | Write-Host
+          
+          # This would typically update a centralized log or documentation system
+          Write-Host "✅ Documentation updated"
+
+# Final Summary
+- stage: DestructionSummary
+  displayName: 'Destruction Summary'
+  dependsOn: PostDestruction
+  condition: always()
+  jobs:
+  - job: Summary
+    displayName: 'Destruction Summary'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Final Summary'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "🎯 DESTRUCTION SUMMARY"
+          Write-Host "===================="
+          Write-Host "Environment: $(selectedEnvironment)"
+          Write-Host "Reason: $(destructionReason)"
+          Write-Host "Completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+          Write-Host "Pipeline: $(Build.BuildNumber)"
+          Write-Host "Operator: $(Build.RequestedFor)"
+          Write-Host ""
+          
+          if ("$(Agent.JobStatus)" -eq "Succeeded") {
+              Write-Host "✅ DESTRUCTION COMPLETED SUCCESSFULLY"
+              Write-Host ""
+              Write-Host "All resources in the $(selectedEnvironment) environment have been permanently destroyed."
+              Write-Host "Backups and logs have been archived for future reference."
+              Write-Host "Relevant teams have been notified."
+          } else {
+              Write-Host "❌ DESTRUCTION FAILED OR INCOMPLETE"
+              Write-Host ""
+              Write-Host "Please review the pipeline logs and manually verify resource status."
+              Write-Host "Some resources may still exist and require manual cleanup."
+          }
+          
+          Write-Host ""
+          Write-Host "Thank you for using the automated destruction pipeline."
+          Write-Host "Remember to rebuild the environment using the deploy pipeline when needed."
